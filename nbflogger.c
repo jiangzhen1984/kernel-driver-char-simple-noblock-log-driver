@@ -8,9 +8,11 @@
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/cdev.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
 
 
-#define MAX_LOGGER_BUF_SIZE (1000)
+#define MAX_LOGGER_BUF_SIZE (8)
 
 #define DEVICE_COUNT (1)
 #define DEVICE_NAME ("nbflogger")
@@ -22,9 +24,9 @@ struct nbf_logger {
     struct cdev c_d;
     char buf[MAX_LOGGER_BUF_SIZE]; 
     unsigned int head_pos;
-    unsigned int offset;
     struct mutex w_lock;
     struct list_head owners;
+    wait_queue_head_t ex_q;
 } lg;
 
 
@@ -39,12 +41,12 @@ struct nbf_logger * g_logger = & lg;
 
 static int nbf_logger_open(struct inode * inode, struct file * file)
 {
-    printk(KERN_INFO" new owner open device\n");
     struct logger_owner * lo = kmalloc(sizeof(struct logger_owner), GFP_KERNEL);
     if (!lo) {
         return -ENOMEM;
     }
 
+    printk(KERN_INFO" new owner open device\n");
     lo->offset = 0;
     INIT_LIST_HEAD(&lo->list);
     mutex_lock(&g_logger->w_lock);
@@ -71,13 +73,69 @@ static int nbf_logger_release(struct inode * inode, struct file * file)
 static ssize_t nbf_logger_read(struct file * file, char __user *buf,
                     size_t count, loff_t * pos)
 {
-    return 0;
+    int len;
+    struct logger_owner * lo = (struct logger_owner *)file->private_data;
+    if (lo->offset == g_logger->head_pos) {
+        if (file->f_flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
+        wait_event_interruptible(g_logger->ex_q,  (lo->offset != g_logger->head_pos) );
+    }
+
+    if (lo->offset < g_logger->head_pos) {
+        len = min(g_logger->head_pos - lo->offset, count);
+    } else {
+        len = min(g_logger->head_pos + (MAX_LOGGER_BUF_SIZE - lo->offset), count);
+    }
+    printk(KERN_INFO" read len :%d  main pos %d  offset pos %d\n", len, g_logger->head_pos, lo->offset);
+
+    if (lo->offset + len >= MAX_LOGGER_BUF_SIZE) {
+        if (copy_to_user(buf, &g_logger->buf[lo->offset], (MAX_LOGGER_BUF_SIZE - lo->offset))) {
+            return -ERESTARTSYS;
+        }
+        len -= (MAX_LOGGER_BUF_SIZE - lo->offset);
+        if (copy_to_user(&buf[MAX_LOGGER_BUF_SIZE - lo->offset], g_logger->buf, len)) {
+            return -ERESTARTSYS;
+        }
+    } else {
+        if (copy_to_user(buf, &g_logger->buf[lo->offset], len)) {
+            return -ERESTARTSYS;
+        }
+    }
+
+    lo->offset = (lo->offset + len ) & (MAX_LOGGER_BUF_SIZE -1);
+    return len;
 }
 
 static ssize_t nbf_logger_write(struct file * file, const char __user *buf,
                     size_t count, loff_t * pos)
 {
-    return 0;
+    int len, least_len, ret;
+    mutex_lock(&g_logger->w_lock);
+    ret = count;
+    if ((g_logger->head_pos + count) > MAX_LOGGER_BUF_SIZE) {
+        len = MAX_LOGGER_BUF_SIZE - g_logger->head_pos;
+        least_len = count - len;
+        if (copy_from_user(&g_logger->buf[g_logger->head_pos], buf, len)) {
+            goto finish;
+        }
+
+        if (copy_from_user(g_logger->buf, &buf[len], least_len - 1)) {
+            goto finish;
+        }
+    } else {
+        if (copy_from_user(&g_logger->buf[g_logger->head_pos], buf, count)) {
+           goto finish;
+        }
+    }
+    
+    
+    g_logger->head_pos = (g_logger->head_pos + count) & (MAX_LOGGER_BUF_SIZE -1);
+    printk(KERN_INFO" wake up queue  head pos %d    count:%d\n", g_logger->head_pos, count);
+    wake_up_interruptible(&g_logger->ex_q);
+finish:
+    mutex_unlock(&g_logger->w_lock);
+    return ret;
 }
 
 
@@ -146,8 +204,8 @@ static int __init nbf_logger_init(void)
 
     mutex_init(&g_logger->w_lock);
     g_logger->head_pos = 0;
-    g_logger->offset = 0;
     INIT_LIST_HEAD(&g_logger->owners);
+    init_waitqueue_head(&g_logger->ex_q);
 
     return ret;
 destroy_device:
@@ -183,3 +241,4 @@ static void __exit nbf_logger_exit(void)
 module_init(nbf_logger_init);
 module_exit(nbf_logger_exit);
 MODULE_LICENSE ("GPL v2");
+
